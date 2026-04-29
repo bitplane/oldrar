@@ -1,13 +1,15 @@
 # oldrar
 
-`oldrar` is a Rust reader and writer for the legacy RAR 1.3/1.4 archive
-family. These archives use the old `RE~^` marker and predate the later
-`Rar!\x1a\x07\x00` signature used by RAR 1.5 and newer.
-
+`oldrar` is a Rust reader and writer for RAR 1.3/1.4 archives from the DOS days.
 The goal is archivist-oriented compatibility with old archives that are not
-handled by many modern tools.
+handled by many modern tools. It's not a very good compressor, but it can make
+test data.
 
-## Current Status
+* [🏠 home](https://bitplane.net/dev/rust/oldrar)
+* [🐱 source](https://github.com/bitplane/oldrar)
+* [🦀 crate](https://crates.io/crates/oldrar)
+
+## Support
 
 - detects `RE~^` archives, including SFX-prefixed archives;
 - parses main/file headers, directory entries, comments, and old-style volume
@@ -18,13 +20,6 @@ handled by many modern tools.
 - reassembles stored and compressed old-style multi-volume archives;
 - writes valid stored and compressed RAR 1.4 archives, including comments,
   file password encryption, solid mode, and old-style volumes.
-
-Deferred:
-
-- cryptographic AV signature verification;
-- AV writing;
-- SFX stub generation;
-- byte-identical WinRAR compressor heuristics.
 
 ## Example
 
