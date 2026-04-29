@@ -1524,6 +1524,7 @@ fn validate_stored_entry(entry: &StoredEntry<'_>) -> Result<()> {
     validate_file_entry(entry.name, entry.data)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_file_entry(
     out: &mut Vec<u8>,
     name: &[u8],
@@ -1551,6 +1552,7 @@ fn write_file_entry(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_file_entry_with_crc(
     out: &mut Vec<u8>,
     name: &[u8],
@@ -1581,6 +1583,7 @@ fn write_file_entry_with_crc(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_split_volumes(
     name: &[u8],
     unpacked: &[u8],
@@ -2082,7 +2085,8 @@ mod tests {
     #[test]
     fn compressed_writer_emits_long_lz_matches() {
         let mut data = short_lz_resistant_prefix(300);
-        data.extend_from_slice(&data[..32].to_vec());
+        let repeated = data[..32].to_vec();
+        data.extend_from_slice(&repeated);
         assert_eq!(
             find_long_lz(&data, 300),
             Some(LongLz {
