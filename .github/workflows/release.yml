@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Default deny; each job re-grants only what it needs.
+permissions: {}
+
+# Releases must never be cancelled mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: oldrar
+  CRATE_NAME: oldrar
+
+jobs:
+  # ----------------------------------------------------------------------
+  # 1. Verify the tag matches Cargo.toml's package version. Refuse to
+  #    publish a v0.2.0 tag if the manifest still says 0.1.0.
+  # ----------------------------------------------------------------------
+  verify-tag:
+    name: Verify tag matches package version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: check
+        name: Check version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF##*/}"             # v0.1.0
+          TAG_VERSION="${TAG#v}"              # 0.1.0
+          MANIFEST_VERSION=$(awk '
+            /^\[package\]/ { in_block=1; next }
+            /^\[/          { in_block=0 }
+            in_block && /^version[[:space:]]*=/ {
+              if (match($0, /"[^"]+"/)) {
+                print substr($0, RSTART+1, RLENGTH-2)
+                exit
+              }
+            }
+          ' Cargo.toml)
+          echo "tag      = $TAG_VERSION"
+          echo "manifest = $MANIFEST_VERSION"
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml package version $MANIFEST_VERSION"
+            exit 1
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------------
+  # 2. Re-run the test suite as a release gate. Nothing else runs unless
+  #    this is green.
+  # ----------------------------------------------------------------------
+  test:
+    name: Test gate
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+  # ----------------------------------------------------------------------
+  # 3. Build release binaries for the supported targets.
+  # ----------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.label }}
+    needs: [verify-tag, test]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+          - label: linux-aarch64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+          - label: macos-universal
+            os: macos-latest
+            target: universal2-apple-darwin
+            setup: ""
+          - label: windows-x86_64-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            setup: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS universal needs both Apple targets; everything else
+          # just needs its own.
+          targets: ${{ matrix.target == 'universal2-apple-darwin' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Platform setup
+        if: matrix.setup != ''
+        shell: bash
+        run: ${{ matrix.setup }}
+
+      # ---- Linux + Windows: build for the single target. ----
+      - name: Build (single target)
+        if: matrix.target != 'universal2-apple-darwin'
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      # ---- macOS: build twice, lipo into one universal binary. ----
+      - name: Build (macOS universal)
+        if: matrix.target == 'universal2-apple-darwin'
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          mkdir -p target/universal2-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/${{ env.BIN_NAME }} \
+            target/aarch64-apple-darwin/release/${{ env.BIN_NAME }} \
+            -output target/universal2-apple-darwin/release/${{ env.BIN_NAME }}
+          file target/universal2-apple-darwin/release/${{ env.BIN_NAME }}
+
+      # ---- Stage the binary into a release dir alongside LICENSE etc. ----
+      - name: Stage release files (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          STAGE="${{ env.BIN_NAME }}-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}"
+          mkdir -p "dist/$STAGE"
+          cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "dist/$STAGE/"
+          if [ -f LICENSE ]; then cp LICENSE "dist/$STAGE/"; fi
+          if [ -f README.md ]; then cp README.md "dist/$STAGE/"; fi
+          tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
+          ls -la dist/
+
+      - name: Stage release files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "$env:BIN_NAME-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}"
+          New-Item -ItemType Directory -Path "dist\$stage" | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\$env:BIN_NAME.exe" "dist\$stage\"
+          if (Test-Path LICENSE)   { Copy-Item LICENSE   "dist\$stage\" }
+          if (Test-Path README.md) { Copy-Item README.md "dist\$stage\" }
+          Compress-Archive -Path "dist\$stage" -DestinationPath "dist\$stage.zip"
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BIN_NAME }}-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # 4. Publish to crates.io. Requires the `release` environment so the
+  #    CARGO_REGISTRY_TOKEN secret is reachable. Set up environment
+  #    protection rules in repo settings to require manual approval.
+  # ----------------------------------------------------------------------
+  publish-crate:
+    name: Publish to crates.io
+    needs: [verify-tag, test]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish crate
+        run: cargo publish --locked

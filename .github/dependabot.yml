@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Keep GitHub Actions versions fresh. Auto-grouped weekly so we don't
+  # get a flood of one-line PRs.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Cargo dependency updates for the crate, monthly.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
