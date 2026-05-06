@@ -1,9 +1,9 @@
+use crate::codec::{unpack15_decode, unpack15_encode, Unpack15, Unpack15Encoder};
+use crate::crypto::{Rar13Cipher, Rar13DecryptReader};
 use crate::detect::{find_archive_start, RAR13_SIGNATURE};
 use crate::error::{Error, Result};
 use crate::features::FeatureSet;
 use crate::version::{ArchiveFamily, ArchiveVersion};
-use crate::codec::{unpack15_decode, unpack15_encode, Unpack15, Unpack15Encoder};
-use crate::crypto::{Rar13Cipher, Rar13DecryptReader};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
