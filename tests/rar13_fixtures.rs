@@ -1,5 +1,6 @@
 use oldrar::rar13::{extract_volumes, file_checksum, Archive};
 use oldrar::{detect_archive_family, find_archive_start, ArchiveFamily, Error};
+use std::io::Write;
 
 const EMPTY: &[u8] = include_bytes!("fixtures/rar13/EMPTY.RAR");
 const BIG80K: &[u8] = include_bytes!("fixtures/rar13/BIG80K.RAR");
@@ -28,6 +29,8 @@ const CMULTIV_R03: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R03");
 const CMULTIV_R04: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R04");
 const CMULTIV_R05: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R05");
 const CMULTIV_R06: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R06");
+const RAR140_NOAV: &[u8] = include_bytes!("fixtures/rar13/rar140_av/rar140_noav_baseline.rar");
+const RAR140_AV: &[u8] = include_bytes!("fixtures/rar13/rar140_av/rar140_av_patched.rar");
 
 #[test]
 fn detects_real_rar1402_archive() {
@@ -35,6 +38,74 @@ fn detects_real_rar1402_archive() {
     assert_eq!(sig.family, ArchiveFamily::Rar13);
     assert_eq!(sig.offset, 0);
     assert_eq!(sig.length, 4);
+}
+
+#[test]
+fn extract_to_reports_rar13_entry_context_on_write_failure() {
+    struct FailWriter;
+
+    impl Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("sink failed"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let archive = Archive::parse(README_STORE).unwrap();
+    let error = archive
+        .extract_to(None, |_meta| Ok(Box::new(FailWriter)))
+        .unwrap_err();
+
+    match error {
+        Error::AtEntry {
+            name,
+            operation,
+            source,
+        } => {
+            assert_eq!(name, b"README");
+            assert_eq!(operation, "extracting");
+            assert!(matches!(*source, Error::Io(_)));
+        }
+        other => panic!("expected entry context, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_rar140_inline_av_shape_fixture() {
+    let archive = Archive::parse(RAR140_AV).expect("parse RAR 1.40 AV fixture");
+    assert_eq!(archive.main.flags, 0xa0);
+    assert_eq!(archive.main.head_size, 53);
+    assert!(archive.main.has_authenticity_verification());
+
+    let av = archive
+        .authenticity_verification()
+        .expect("parse AV")
+        .expect("AV present");
+    assert_eq!(av.size, 44);
+    assert_eq!(av.prefix, *b"\x1ai\x6d\x02\xda\xae");
+    assert_eq!(av.cipher_body.len(), 38);
+    assert_eq!(
+        archive.verify_authenticity_verification().unwrap(),
+        oldrar::rar13::AuthenticityVerificationStatus::StructurallyValid
+    );
+
+    let extracted = archive.extract(None).expect("extract AV-bearing archive");
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].data, b"hello\n");
+}
+
+#[test]
+fn reports_absent_av_on_rar140_control_fixture() {
+    let archive = Archive::parse(RAR140_NOAV).expect("parse RAR 1.40 baseline fixture");
+    assert!(!archive.main.has_authenticity_verification());
+    assert!(archive.authenticity_verification().unwrap().is_none());
+    assert_eq!(
+        archive.verify_authenticity_verification().unwrap(),
+        oldrar::rar13::AuthenticityVerificationStatus::Absent
+    );
 }
 
 #[test]

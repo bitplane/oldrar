@@ -1,9 +1,9 @@
-use crate::codec::{unpack15_decode, unpack15_encode, Unpack15, Unpack15Encoder};
-use crate::crypto::{Rar13Cipher, Rar13DecryptReader};
 use crate::detect::{find_archive_start, RAR13_SIGNATURE};
 use crate::error::{Error, Result};
 use crate::features::FeatureSet;
 use crate::version::{ArchiveFamily, ArchiveVersion};
+use crate::codec::{unpack15_decode, unpack15_encode, Unpack15, Unpack15Encoder};
+use crate::crypto::{Rar13Cipher, Rar13DecryptReader};
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -26,9 +26,12 @@ const LHD_PASSWORD: u8 = 0x04;
 const LHD_COMMENT: u8 = 0x08;
 const LHD_SOLID: u8 = 0x10;
 const METHOD_STORE: u8 = 0;
+const METHOD_BEST: u8 = 5;
 const DEFAULT_UNP_VER: u8 = 2;
+const MIN_STORE_FALLBACK_SIZE: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MainHeader {
     pub flags: u8,
     pub head_size: u16,
@@ -36,6 +39,7 @@ pub struct MainHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileHeader {
     pub flags: u8,
     pub pack_size: u32,
@@ -49,6 +53,7 @@ pub struct FileHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Entry {
     pub header: FileHeader,
     pub name: Vec<u8>,
@@ -57,6 +62,7 @@ pub struct Entry {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Archive {
     pub sfx_offset: usize,
     pub main: MainHeader,
@@ -71,6 +77,7 @@ enum ArchiveSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AuthenticityVerification {
     pub size: u16,
     pub prefix: [u8; 6],
@@ -78,6 +85,7 @@ pub struct AuthenticityVerification {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthenticityVerificationStatus {
     Absent,
     StructurallyValid,
@@ -478,15 +486,19 @@ impl Archive {
             }
             let mut writer = open(&meta)?;
             if entry.is_stored() && !entry.is_encrypted() {
-                entry.write_stored_to(self, password, &mut writer)?;
+                entry
+                    .write_stored_to(self, password, &mut writer)
+                    .map_err(|error| entry.entry_error("extracting", error))?;
             } else {
-                entry.write_compressed_to(
-                    self,
-                    password,
-                    &mut unpack15,
-                    self.main.is_solid() && extracted_count != 0,
-                    &mut writer,
-                )?;
+                entry
+                    .write_compressed_to(
+                        self,
+                        password,
+                        &mut unpack15,
+                        self.main.is_solid() && extracted_count != 0,
+                        &mut writer,
+                    )
+                    .map_err(|error| entry.entry_error("extracting", error))?;
             }
             extracted_count += 1;
         }
@@ -827,6 +839,16 @@ impl Entry {
             is_directory: false,
         })
     }
+
+    fn entry_error(&self, operation: &'static str, error: Error) -> Error {
+        if matches!(
+            error,
+            Error::NeedPassword | Error::WrongPasswordOrCorruptData
+        ) {
+            return error;
+        }
+        error.at_entry(self.name.clone(), operation)
+    }
 }
 
 /// Convenience multivolume extraction API that buffers each extracted entry in
@@ -919,13 +941,15 @@ where
                     continue;
                 }
                 let mut writer = open(&meta)?;
-                entry.write_compressed_to(
-                    archive,
-                    password,
-                    &mut unpack15,
-                    archive.main.is_solid() && extracted_count != 0,
-                    &mut writer,
-                )?;
+                entry
+                    .write_compressed_to(
+                        archive,
+                        password,
+                        &mut unpack15,
+                        archive.main.is_solid() && extracted_count != 0,
+                        &mut writer,
+                    )
+                    .map_err(|error| entry.entry_error("extracting", error))?;
                 extracted_count += 1;
                 continue;
             }
@@ -945,14 +969,9 @@ where
                     current.append(entry, volume_index, entry_index)?;
                     let completed = pending.take().expect("pending split");
                     let solid = archive.main.is_solid() && extracted_count != 0;
-                    completed.write_to(
-                        volumes,
-                        entry,
-                        password,
-                        &mut unpack15,
-                        solid,
-                        &mut open,
-                    )?;
+                    completed
+                        .write_to(volumes, entry, password, &mut unpack15, solid, &mut open)
+                        .map_err(|error| entry.entry_error("extracting", error))?;
                     extracted_count += 1;
                 }
                 _ => {
@@ -1283,10 +1302,20 @@ pub fn write_compressed_archive_with_comment(
 
     for entry in entries {
         validate_file_entry(entry.name, entry.data)?;
+        let solid = solid_encoder.is_some();
         let mut packed = if let Some(encoder) = solid_encoder.as_mut() {
             encoder.encode_member(entry.data)?
         } else {
             unpack15_encode(entry.data)?
+        };
+        let method = if !solid
+            && entry.data.len() >= MIN_STORE_FALLBACK_SIZE
+            && packed.len() >= entry.data.len()
+        {
+            packed = entry.data.to_vec();
+            METHOD_STORE
+        } else {
+            METHOD_BEST
         };
         if let Some(password) = entry.password {
             Rar13Cipher::new(password).encrypt_in_place(&mut packed);
@@ -1304,15 +1333,18 @@ pub fn write_compressed_archive_with_comment(
         let file_extra = encode_file_comment(entry.file_comment)?;
         write_file_entry(
             &mut out,
-            entry.name,
-            entry.data,
-            &packed,
-            entry.file_time,
-            entry.file_attr,
-            flags,
-            DEFAULT_UNP_VER,
-            3,
-            &file_extra,
+            FileEntryRecord {
+                name: entry.name,
+                unpacked_size: entry.data.len() as u32,
+                file_crc: file_checksum(entry.data),
+                packed: &packed,
+                file_time: entry.file_time,
+                file_attr: entry.file_attr,
+                flags,
+                unp_ver: DEFAULT_UNP_VER,
+                method,
+                extra: &file_extra,
+            },
         )?;
     }
 
@@ -1338,17 +1370,17 @@ pub fn write_stored_volumes(
     )?;
 
     let body = entry.data.to_vec();
-    write_split_volumes(
-        entry.name,
-        entry.data,
-        &body,
-        entry.file_time,
-        entry.file_attr,
-        METHOD_STORE,
-        0,
-        options.features,
+    write_split_volumes(SplitVolumeRecord {
+        name: entry.name,
+        unpacked: entry.data,
+        packed: &body,
+        file_time: entry.file_time,
+        file_attr: entry.file_attr,
+        method: METHOD_STORE,
+        base_flags: 0,
+        features: options.features,
         max_packed_per_volume,
-    )
+    })
 }
 
 pub fn write_compressed_volumes(
@@ -1370,17 +1402,17 @@ pub fn write_compressed_volumes(
     )?;
 
     let packed = unpack15_encode(entry.data)?;
-    write_split_volumes(
-        entry.name,
-        entry.data,
-        &packed,
-        entry.file_time,
-        entry.file_attr,
-        3,
-        0,
-        options.features,
+    write_split_volumes(SplitVolumeRecord {
+        name: entry.name,
+        unpacked: entry.data,
+        packed: &packed,
+        file_time: entry.file_time,
+        file_attr: entry.file_attr,
+        method: METHOD_BEST,
+        base_flags: 0,
+        features: options.features,
         max_packed_per_volume,
-    )
+    })
 }
 
 fn validate_stored_writer_features(version: ArchiveVersion, features: FeatureSet) -> Result<()> {
@@ -1507,15 +1539,18 @@ fn write_stored_entry(
     let file_extra = encode_file_comment(entry.file_comment)?;
     write_file_entry(
         out,
-        entry.name,
-        entry.data,
-        &body,
-        entry.file_time,
-        entry.file_attr,
-        flags,
-        DEFAULT_UNP_VER,
-        METHOD_STORE,
-        &file_extra,
+        FileEntryRecord {
+            name: entry.name,
+            unpacked_size: entry.data.len() as u32,
+            file_crc: file_checksum(entry.data),
+            packed: &body,
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            flags,
+            unp_ver: DEFAULT_UNP_VER,
+            method: METHOD_STORE,
+            extra: &file_extra,
+        },
     )?;
     Ok(())
 }
@@ -1524,89 +1559,62 @@ fn validate_stored_entry(entry: &StoredEntry<'_>) -> Result<()> {
     validate_file_entry(entry.name, entry.data)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_file_entry(
-    out: &mut Vec<u8>,
-    name: &[u8],
-    unpacked: &[u8],
-    packed: &[u8],
-    file_time: u32,
-    file_attr: u8,
-    flags: u8,
-    unp_ver: u8,
-    method: u8,
-    extra: &[u8],
-) -> Result<()> {
-    write_file_entry_with_crc(
-        out,
-        name,
-        unpacked.len() as u32,
-        file_checksum(unpacked),
-        packed,
-        file_time,
-        file_attr,
-        flags,
-        unp_ver,
-        method,
-        extra,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_file_entry_with_crc(
-    out: &mut Vec<u8>,
-    name: &[u8],
+struct FileEntryRecord<'a> {
+    name: &'a [u8],
     unpacked_size: u32,
     file_crc: u16,
-    packed: &[u8],
+    packed: &'a [u8],
     file_time: u32,
     file_attr: u8,
     flags: u8,
     unp_ver: u8,
     method: u8,
-    extra: &[u8],
-) -> Result<()> {
-    let head_size = FILE_HEAD_BASE_SIZE + name.len() + extra.len();
-    out.extend_from_slice(&(packed.len() as u32).to_le_bytes());
-    out.extend_from_slice(&unpacked_size.to_le_bytes());
-    out.extend_from_slice(&file_crc.to_le_bytes());
+    extra: &'a [u8],
+}
+
+fn write_file_entry(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()> {
+    let head_size = FILE_HEAD_BASE_SIZE + entry.name.len() + entry.extra.len();
+    out.extend_from_slice(&(entry.packed.len() as u32).to_le_bytes());
+    out.extend_from_slice(&entry.unpacked_size.to_le_bytes());
+    out.extend_from_slice(&entry.file_crc.to_le_bytes());
     out.extend_from_slice(&(head_size as u16).to_le_bytes());
-    out.extend_from_slice(&file_time.to_le_bytes());
-    out.push(file_attr);
-    out.push(flags);
-    out.push(unp_ver);
-    out.push(name.len() as u8);
-    out.push(method);
-    out.extend_from_slice(name);
-    out.extend_from_slice(extra);
-    out.extend_from_slice(packed);
+    out.extend_from_slice(&entry.file_time.to_le_bytes());
+    out.push(entry.file_attr);
+    out.push(entry.flags);
+    out.push(entry.unp_ver);
+    out.push(entry.name.len() as u8);
+    out.push(entry.method);
+    out.extend_from_slice(entry.name);
+    out.extend_from_slice(entry.extra);
+    out.extend_from_slice(entry.packed);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_split_volumes(
-    name: &[u8],
-    unpacked: &[u8],
-    packed: &[u8],
+struct SplitVolumeRecord<'a> {
+    name: &'a [u8],
+    unpacked: &'a [u8],
+    packed: &'a [u8],
     file_time: u32,
     file_attr: u8,
     method: u8,
     base_flags: u8,
     features: FeatureSet,
     max_packed_per_volume: usize,
-) -> Result<Vec<Vec<u8>>> {
-    if max_packed_per_volume == 0 {
+}
+
+fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
+    if entry.max_packed_per_volume == 0 {
         return Err(Error::InvalidHeader(
             "RAR 1.3 volume payload size must be non-zero",
         ));
     }
-    if packed.is_empty() {
+    if entry.packed.is_empty() {
         return Err(Error::InvalidHeader(
             "RAR 1.3 volume writer needs a non-empty packed payload",
         ));
     }
 
-    let chunks: Vec<&[u8]> = packed.chunks(max_packed_per_volume).collect();
+    let chunks: Vec<&[u8]> = entry.packed.chunks(entry.max_packed_per_volume).collect();
     if chunks.len() < 2 {
         return Err(Error::InvalidHeader(
             "RAR 1.3 volume writer needs at least two volumes",
@@ -1617,32 +1625,34 @@ fn write_split_volumes(
     for (index, chunk) in chunks.iter().enumerate() {
         let split_before = index > 0;
         let split_after = index + 1 < chunks.len();
-        let mut flags = base_flags;
+        let mut flags = entry.base_flags;
         if split_before {
             flags |= LHD_SPLIT_BEFORE;
         }
         if split_after {
             flags |= LHD_SPLIT_AFTER;
         }
-        if features.solid {
+        if entry.features.solid {
             flags |= LHD_SOLID;
         }
 
         let mut out = Vec::new();
-        write_main_header_with_flags(&mut out, features, None, MHD_VOLUME)?;
-        let checksum_data = if split_after { *chunk } else { unpacked };
-        write_file_entry_with_crc(
+        write_main_header_with_flags(&mut out, entry.features, None, MHD_VOLUME)?;
+        let checksum_data = if split_after { *chunk } else { entry.unpacked };
+        write_file_entry(
             &mut out,
-            name,
-            unpacked.len() as u32,
-            file_checksum(checksum_data),
-            chunk,
-            file_time,
-            file_attr,
-            flags,
-            DEFAULT_UNP_VER,
-            method,
-            &[],
+            FileEntryRecord {
+                name: entry.name,
+                unpacked_size: entry.unpacked.len() as u32,
+                file_crc: file_checksum(checksum_data),
+                packed: chunk,
+                file_time: entry.file_time,
+                file_attr: entry.file_attr,
+                flags,
+                unp_ver: DEFAULT_UNP_VER,
+                method: entry.method,
+                extra: &[],
+            },
         )?;
         volumes.push(out);
     }
@@ -2030,7 +2040,7 @@ mod tests {
         assert_eq!(archive.entries.len(), 1);
         assert_eq!(archive.entries[0].name, b"tiny.txt");
         assert!(!archive.entries[0].is_stored());
-        assert_eq!(archive.entries[0].header.method, 3);
+        assert_eq!(archive.entries[0].header.method, METHOD_BEST);
         assert!(archive.entries[0].header.pack_size > 0);
 
         let extracted = archive.extract(None).unwrap();
@@ -2052,7 +2062,7 @@ mod tests {
 
         let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
-        assert_eq!(archive.entries[0].header.method, 3);
+        assert_eq!(archive.entries[0].header.method, METHOD_BEST);
 
         let extracted = archive.extract(None).unwrap();
         assert_eq!(extracted[0].data, data);
@@ -2072,7 +2082,7 @@ mod tests {
 
         let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
-        assert_eq!(archive.entries[0].header.method, 3);
+        assert_eq!(archive.entries[0].header.method, METHOD_BEST);
         assert!(
             archive.entries[0].header.pack_size < data.len() as u32,
             "ShortLZ should make the repeated payload smaller than stored data"
@@ -2085,13 +2095,12 @@ mod tests {
     #[test]
     fn compressed_writer_emits_long_lz_matches() {
         let mut data = short_lz_resistant_prefix(300);
-        let repeated = data[..32].to_vec();
-        data.extend_from_slice(&repeated);
+        data.extend_from_within(..32);
         assert_eq!(
             find_long_lz(&data, 300),
             Some(LongLz {
                 distance: 300,
-                length: 18
+                length: 32
             })
         );
         let input = [FileEntry {
@@ -2109,7 +2118,7 @@ mod tests {
             .len();
         let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
-        assert_eq!(archive.entries[0].header.method, 3);
+        assert_eq!(archive.entries[0].header.method, METHOD_BEST);
         assert!(
             (archive.entries[0].header.pack_size as usize) < literal_only,
             "LongLZ should make a >256-byte-distance repeat smaller than literal-only output"
@@ -2117,6 +2126,34 @@ mod tests {
 
         let extracted = archive.extract(None).unwrap();
         assert_eq!(extracted[0].data, data);
+    }
+
+    #[test]
+    fn compressed_writer_stores_incompressible_member_when_smaller() {
+        let mut state = 0x8765_4321u32;
+        let data: Vec<_> = (0..8192)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let input = [FileEntry {
+            name: b"randomish.bin",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        }];
+
+        let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+
+        assert_eq!(archive.entries[0].header.method, METHOD_STORE);
+        assert_eq!(archive.entries[0].header.pack_size, data.len() as u32);
+        assert_eq!(archive.extract(None).unwrap()[0].data, data);
     }
 
     #[test]
@@ -2174,7 +2211,7 @@ mod tests {
         let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
         assert!(archive.entries[0].is_encrypted());
-        assert_eq!(archive.entries[0].header.method, 3);
+        assert_eq!(archive.entries[0].header.method, METHOD_BEST);
         assert!(matches!(archive.extract(None), Err(Error::NeedPassword)));
 
         let extracted = archive.extract(Some(b"pass")).unwrap();
@@ -2297,7 +2334,7 @@ mod tests {
 
         let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
-        assert_eq!(archive.entries[0].header.method, 3);
+        assert_eq!(archive.entries[0].header.method, METHOD_BEST);
         assert_eq!(archive.entries[0].header.pack_size, 0);
 
         let extracted = archive.extract(None).unwrap();

@@ -2,8 +2,9 @@
 
 `oldrar` is a Rust reader and writer for RAR 1.3/1.4 archives from the DOS days.
 The goal is archivist-oriented compatibility with old archives that are not
-handled by many modern tools. It's not a very good compressor, but it can make
-test data.
+handled by many modern tools. The Unpack15 encoder is parity-close with DOS
+RAR 1.402 `-m5` (cost-aware match selection, lazy matching, repeat-last and
+old-distance ring tokens), with a store fallback for incompressible payloads.
 
 * [🏠 home](https://bitplane.net/dev/rust/oldrar)
 * [🐱 source](https://github.com/bitplane/oldrar)
@@ -12,14 +13,16 @@ test data.
 ## Support
 
 - detects `RE~^` archives, including SFX-prefixed archives;
-- parses main/file headers, directory entries, comments, and old-style volume
-  flags;
+- parses main/file headers, directory entries, comments, old-style volume
+  flags, and the RAR 1.40 authenticity-verification record;
 - extracts stored and Unpack15-compressed files;
 - supports the historical RAR 1.4 password cipher for file data;
 - supports solid archives;
 - reassembles stored and compressed old-style multi-volume archives;
 - writes valid stored and compressed RAR 1.4 archives, including comments,
-  file password encryption, solid mode, and old-style volumes.
+  file password encryption, solid mode, and old-style volumes;
+- falls back to store automatically when the compressed output would be
+  larger than the input.
 
 ## Example
 
