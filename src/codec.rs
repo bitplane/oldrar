@@ -184,6 +184,9 @@ impl Unpack15Encoder {
             let mut plan_last_length = self.last_length;
             let mut plan_old_dist = self.old_dist;
             let mut plan_old_dist_ptr = self.old_dist_ptr;
+            let mut plan_avr_ln2 = self.avr_ln2;
+            let mut plan_avr_ln3 = self.avr_ln3;
+            let mut plan_max_dist3 = self.max_dist3;
             let mut plan_l_count = self.l_count;
             let mut plan_num_huf = self.num_huf;
             let mut group_enters_stmode = false;
@@ -198,13 +201,14 @@ impl Unpack15Encoder {
                             last_length: plan_last_length,
                             old_dist: plan_old_dist,
                             old_dist_ptr: plan_old_dist_ptr,
+                            max_dist3: plan_max_dist3,
                             nlzb: plan_nlzb,
                             nhfb: plan_nhfb,
                             l_count: plan_l_count,
                         },
                         flag_bits,
                     )
-                    .filter(|token| !should_lazy_emit_literal(input, pos, *token, self.max_dist3))
+                    .filter(|token| !should_lazy_emit_literal(input, pos, *token, plan_max_dist3))
                 {
                     let flag = token.flag_bits(plan_nlzb, plan_nhfb);
                     let next_pos = pos + token.length() as usize;
@@ -217,6 +221,15 @@ impl Unpack15Encoder {
                         token.plan_effect(&mut plan_nhfb, &mut plan_nlzb);
                         token.plan_l_count_effect(&mut plan_l_count);
                         token.plan_num_huf_effect(&mut plan_num_huf);
+                        if let EncodedToken::LongLz(long_lz) = token {
+                            plan_long_lz_adaptive_effect(
+                                long_lz,
+                                &mut plan_avr_ln2,
+                                &mut plan_avr_ln3,
+                                self.avr_plc,
+                                &mut plan_max_dist3,
+                            );
+                        }
                         if let Some((distance, length)) = token.match_state() {
                             plan_remember_match(
                                 &mut plan_old_dist,
@@ -270,7 +283,7 @@ impl Unpack15Encoder {
             state.last_length,
             state.old_dist,
             state.old_dist_ptr,
-            self.max_dist3,
+            state.max_dist3,
         );
         candidates
             .into_iter()
@@ -320,7 +333,7 @@ impl Unpack15Encoder {
             }
             EncodedToken::OldDist(token) => {
                 let length_code =
-                    old_dist_lz_length_code(token.length, token.distance, self.max_dist3)?;
+                    old_dist_lz_length_code(token.length, token.distance, state.max_dist3)?;
                 Some(
                     flag_cost
                         + l_count_break_bit_cost(state.l_count)
@@ -329,7 +342,7 @@ impl Unpack15Encoder {
                 )
             }
             EncodedToken::LongLz(token) => {
-                let length_code = self.long_lz_length_code(token)?;
+                let length_code = long_lz_length_code_for_distance(token, state.max_dist3)?;
                 let distance_place = self.long_lz_distance_place(token.distance).ok()?;
                 Some(
                     flag_cost
@@ -763,6 +776,7 @@ struct LzPlanState {
     last_length: u32,
     old_dist: [u32; 4],
     old_dist_ptr: usize,
+    max_dist3: u32,
     nlzb: u32,
     nhfb: u32,
     l_count: u32,
@@ -914,6 +928,36 @@ fn plan_remember_match(
     *last_length = length;
 }
 
+fn plan_long_lz_adaptive_effect(
+    long_lz: LongLz,
+    avr_ln2: &mut u32,
+    avr_ln3: &mut u32,
+    avr_plc: u32,
+    max_dist3: &mut u32,
+) {
+    let old_avr2 = *avr_ln2;
+    let old_avr3 = *avr_ln3;
+    let Some(length_code) = long_lz_length_code_for_distance(long_lz, *max_dist3) else {
+        return;
+    };
+
+    *avr_ln2 += length_code;
+    *avr_ln2 -= *avr_ln2 >> 5;
+    if length_code != 1 && length_code != 4 {
+        if length_code == 0 && long_lz.distance <= *max_dist3 {
+            *avr_ln3 += 1;
+            *avr_ln3 -= *avr_ln3 >> 8;
+        } else if *avr_ln3 > 0 {
+            *avr_ln3 -= 1;
+        }
+    }
+    if old_avr3 > 0xb0 || (avr_plc >= 0x2a00 && old_avr2 < 0x40) {
+        *max_dist3 = 0x7f00;
+    } else {
+        *max_dist3 = 0x2001;
+    }
+}
+
 fn find_lz_token(
     input: &[u8],
     pos: usize,
@@ -1037,7 +1081,7 @@ fn find_old_dist_lz(
     pos: usize,
     old_dist: [u32; 4],
     old_dist_ptr: usize,
-    max_dist3: u32,
+    _max_dist3: u32,
 ) -> Option<OldDistLz> {
     let mut best = OldDistLz {
         distance: 0,
@@ -1063,7 +1107,7 @@ fn find_old_dist_lz(
             length += 1;
         }
         if length >= 3
-            && old_dist_lz_length_code(length as u32, distance, max_dist3).is_some()
+            && old_dist_lz_is_encodable(length as u32, distance)
             && length > best.length as usize
         {
             best = OldDistLz {
@@ -1075,6 +1119,11 @@ fn find_old_dist_lz(
     }
 
     (best.length >= 3).then_some(best)
+}
+
+fn old_dist_lz_is_encodable(length: u32, distance: u32) -> bool {
+    old_dist_lz_length_code(length, distance, 0x2001).is_some()
+        && old_dist_lz_length_code(length, distance, 0x7f00).is_some()
 }
 
 fn old_dist_lz_length_code(length: u32, distance: u32, max_dist3: u32) -> Option<u32> {
@@ -1314,6 +1363,7 @@ impl Unpack15 {
         out: &mut impl Write,
     ) -> Result<()> {
         const INPUT_CHUNK: usize = 64 * 1024;
+        const OUTPUT_CHUNK: usize = 64 * 1024;
 
         self.init_member(target, solid);
         self.bits = BitReader::new(&[]);
@@ -1321,25 +1371,36 @@ impl Unpack15 {
         let mut buffer = [0u8; INPUT_CHUNK];
 
         while self.output_written < self.target {
-            let checkpoint = self.clone();
-            match self.decode_step(out) {
-                Ok(()) => {}
-                Err(Error::NeedMoreInput) if !input_done => {
-                    *self = checkpoint;
-                    let read = input
-                        .read(&mut buffer)
-                        .map_err(|_| Error::InvalidData("RAR 1.3 input read failed"))?;
-                    if read == 0 {
-                        input_done = true;
-                        self.bits.finish();
-                    } else {
-                        self.bits.append(&buffer[..read]);
+            let chunk_target = self
+                .output_written
+                .saturating_add(OUTPUT_CHUNK)
+                .min(self.target);
+            loop {
+                let checkpoint = self.clone();
+                let mut chunk = Vec::with_capacity(chunk_target - self.output_written);
+                match self.decode_loop_until(chunk_target, &mut chunk) {
+                    Ok(()) => {
+                        out.write_all(&chunk)
+                            .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
+                        break;
                     }
+                    Err(Error::NeedMoreInput) if !input_done => {
+                        *self = checkpoint;
+                        let read = input
+                            .read(&mut buffer)
+                            .map_err(|_| Error::InvalidData("RAR 1.3 input read failed"))?;
+                        if read == 0 {
+                            input_done = true;
+                            self.bits.finish();
+                        } else {
+                            self.bits.append(&buffer[..read]);
+                        }
+                    }
+                    Err(Error::NeedMoreInput) => {
+                        return Err(Error::InvalidData("RAR 1.3 bitstream is truncated"));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(Error::NeedMoreInput) => {
-                    return Err(Error::InvalidData("RAR 1.3 bitstream is truncated"));
-                }
-                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -1363,7 +1424,11 @@ impl Unpack15 {
             return Ok(());
         }
 
-        while self.output_written < self.target {
+        self.decode_loop_until(self.target, out)
+    }
+
+    fn decode_loop_until(&mut self, target: usize, out: &mut impl Write) -> Result<()> {
+        while self.output_written < target {
             self.decode_step(out)?;
         }
 
@@ -1980,6 +2045,7 @@ mod tests {
                     last_length: 0,
                     old_dist: encoder.old_dist,
                     old_dist_ptr: encoder.old_dist_ptr,
+                    max_dist3: encoder.max_dist3,
                     nlzb: encoder.nlzb,
                     nhfb: encoder.nhfb,
                     l_count: encoder.l_count,
@@ -1995,6 +2061,42 @@ mod tests {
                 length: 10,
             })
         );
+    }
+
+    #[test]
+    fn planner_uses_simulated_max_dist3_for_old_distance_candidates() {
+        let mut state = 0x1234_5678u32;
+        let mut input = Vec::with_capacity(9004);
+        for _ in 0..9004 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            input.push(state as u8);
+        }
+        let pos = 9000;
+        let prefix = [input[0], input[1], input[2]];
+        input[pos..pos + 3].copy_from_slice(&prefix);
+        input[pos + 3] = input[3].wrapping_add(1);
+
+        let mut encoder = Unpack15Encoder::new();
+        encoder.max_dist3 = 0x7f00;
+        let token = encoder.choose_lz_token(
+            &input,
+            pos,
+            LzPlanState {
+                last_dist: u32::MAX,
+                last_length: 0,
+                old_dist: [u32::MAX, u32::MAX, u32::MAX, 9000],
+                old_dist_ptr: 0,
+                max_dist3: 0x2001,
+                nlzb: encoder.nlzb,
+                nhfb: encoder.nhfb,
+                l_count: encoder.l_count,
+            },
+            0,
+        );
+
+        assert_eq!(token, None);
     }
 
     #[test]
